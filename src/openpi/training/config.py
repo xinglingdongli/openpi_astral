@@ -4,7 +4,9 @@ import abc
 from collections.abc import Sequence
 import dataclasses
 import difflib
+import json
 import logging
+import os
 import pathlib
 from typing import Any, Literal, Protocol, TypeAlias
 
@@ -18,6 +20,7 @@ import openpi.models.pi0_config as pi0_config
 import openpi.models.pi0_fast as pi0_fast
 import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
+import openpi.policies.astral_policy as astral_policy
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
 import openpi.shared.download as _download
@@ -462,6 +465,132 @@ class LeRobotDROIDDataConfig(DataConfigFactory):
         )
 
 
+def _astral_dataset_meta(repo_id: str) -> dict:
+    """Reads meta/info.json of a local LeRobot v2.1 dataset.
+
+    Resolves the same way the pinned lerobot (0.1.0) resolves `root`:
+    ${HF_LEROBOT_HOME:-~/.cache/huggingface/lerobot}/<repo_id> — an absolute
+    repo_id also works because pathlib joining with an absolute path yields
+    the absolute path itself. Note the pinned lerobot raises if LEROBOT_HOME
+    is set (deprecated); only HF_LEROBOT_HOME is honored.
+    """
+    lerobot_home = pathlib.Path(
+        os.environ.get("HF_LEROBOT_HOME", "~/.cache/huggingface/lerobot")
+    ).expanduser()
+    info_path = (lerobot_home / repo_id / "meta" / "info.json").resolve()
+    if not info_path.exists():
+        raise FileNotFoundError(
+            f"Astral dataset meta not found at {info_path}. Place or symlink the "
+            "converted dataset there first (see examples/astral/README.md)."
+        )
+    return json.loads(info_path.read_text())
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotAstralDataConfig(DataConfigFactory):
+    """Data config for Astral teleop robots (loopkok astral_ws), schema-driven.
+
+    Adapts automatically to the dataset produced by astral_data_collect, no
+    matter which arms / end-effectors / body blocks were enabled at collection
+    time:
+      - state/action dims and delta-vs-absolute split are derived from the
+        `names` in the dataset meta: dims matching `absolute_dim_patterns`
+        (default: end-effector blocks "*_ee_*") stay absolute, everything else
+        (arm/waist/head joints) becomes deltas w.r.t. the chunk-start state;
+      - camera wiring is explicit via `camera_map` (model slot -> dataset key);
+        unmapped pi05 slots are zero-padded with mask=False.
+
+    Structural limit: pi05_base was pretrained with action_dim=32 — the total
+    state dim must fit (single arm+gripper 8, dual arm 16, arm+wuji 27; dual
+    arm + dual wuji 38 would NOT fit).
+    """
+
+    # Fallback prompt injected when the episode's task string is empty.
+    default_prompt: str | None = None
+    # Model image slot -> dataset camera key. Default: base view (realsense) as
+    # base_0_rgb, left wrist as left_wrist_0_rgb; right wrist slot zero-padded
+    # (mask=False) unless `right_wrist_0_rgb` is added (new 3-camera data — see
+    # the pi05_astral_3cam / pi05_astral_lora_3cam configs). Labels are the
+    # streamer's stable semantic names (quest3_video_streamer label_aliases pins
+    # them by hardware fingerprint; they no longer track kernel videoN).
+    camera_map: dict[str, str] = dataclasses.field(
+        default_factory=lambda: {
+            "base_0_rgb": "observation.images.base",
+            "left_wrist_0_rgb": "observation.images.left_wrist",
+        }
+    )
+    # State dims whose name contains any of these substrings stay ABSOLUTE;
+    # all other dims are converted to deltas. "_ee_" covers both gripper ratio
+    # and wuji hand blocks (names look like "left_ee_0").
+    absolute_dim_patterns: Sequence[str] = ("_ee_",)
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        meta = _astral_dataset_meta(self.repo_id)
+        features = meta["features"]
+
+        state_names = features["observation.state"]["names"]
+        state_dim = features["observation.state"]["shape"][0]
+        if state_dim > model_config.action_dim:
+            raise ValueError(
+                f"Dataset state_dim={state_dim} exceeds model action_dim="
+                f"{model_config.action_dim} (pi05_base limit). Reduce enabled "
+                "blocks in data_collect.yaml."
+            )
+        unknown_cams = set(self.camera_map.values()) - set(features)
+        if unknown_cams:
+            raise ValueError(
+                f"camera_map references dataset keys not present in meta: {sorted(unknown_cams)}"
+            )
+
+        # Repack (dataset-only): map native keys onto the inference key
+        # convention that AstralInputs also expects from the policy client.
+        repack_structure: dict[str, str] = {
+            "observation/state": "observation.state",
+            "actions": "action",
+            "prompt": "prompt",
+        }
+        cameras = {}
+        for slot, dataset_key in self.camera_map.items():
+            input_key = f"observation/camera/{slot}"
+            repack_structure[input_key] = dataset_key
+            cameras[slot] = input_key
+        repack_transform = _transforms.Group(
+            inputs=[_transforms.RepackTransform(repack_structure)]
+        )
+
+        data_transforms = _transforms.Group(
+            inputs=[
+                astral_policy.AstralInputs(
+                    model_type=model_config.model_type, cameras=cameras
+                )
+            ],
+            outputs=[astral_policy.AstralOutputs(action_dim=state_dim)],
+        )
+        # Delta for every dim not matching absolute_dim_patterns (default: only
+        # "*_ee_*" stays absolute). Runs after AstralInputs, which creates the
+        # "state" key; deltas are computed BEFORE normalization, so norm stats
+        # must be (re)computed whenever the dataset layout changes.
+        delta_mask = tuple(
+            not any(pat in name for pat in self.absolute_dim_patterns)
+            for name in state_names
+        )
+        data_transforms = data_transforms.push(
+            inputs=[_transforms.DeltaActions(delta_mask)],
+            outputs=[_transforms.AbsoluteActions(delta_mask)],
+        )
+        model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            # The dataset's action column is named "action" (not "actions").
+            action_sequence_keys=("action",),
+        )
+
+
 @dataclasses.dataclass(frozen=True)
 class TrainConfig:
     # Name of the config. Must be unique. Will be used to reference this config.
@@ -759,6 +888,139 @@ _CONFIGS = [
         ema_decay=0.999,
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         pytorch_weight_path="/path/to/your/pytorch_weight_path",
+        num_train_steps=30_000,
+    ),
+    #
+    # Astral single-arm teleop (loopkok) pi05 fine-tuning. See examples/astral/README.md.
+    #
+    TrainConfig(
+        name="pi05_astral",
+        # action_horizon=50 ~= 1.67s chunks @30fps, matching the validated
+        # real-robot pi05 recipes (piper_openpi fork + the pi05_aloha example);
+        # discrete_state_input=False routes state through the continuous suffix
+        # input instead of language tokens.
+        # Full fine-tuning on a single 24GB card will very likely OOM: drop
+        # batch_size to 4 or switch to pi05_astral_lora.
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=50, discrete_state_input=False),
+        data=LeRobotAstralDataConfig(
+            # Local dataset: place (or symlink) astral_data_lerobot at
+            # ${HF_LEROBOT_HOME:-~/.cache/huggingface/lerobot}/astral/astral_teleop
+            repo_id="astral/astral_teleop",
+            base_config=DataConfig(prompt_from_task=True),
+            default_prompt="perform the manipulation task",
+        ),
+        batch_size=8,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=5e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=30_000,
+    ),
+    TrainConfig(
+        name="pi05_astral_lora",
+        # LoRA variant: the recommended path on a single 24GB card (e.g. 4090D).
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=50,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotAstralDataConfig(
+            repo_id="astral/astral_teleop",
+            base_config=DataConfig(prompt_from_task=True),
+            default_prompt="perform the manipulation task",
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=1e-4,
+            decay_steps=30_000,
+            decay_lr=1e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        # LoRA: disable EMA and freeze all non-LoRA params (the freeze filter must
+        # match the model variants above).
+        ema_decay=None,
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=50,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=30_000,
+    ),
+    # 3-camera variants (base + left wrist + right wrist): for NEW collection data
+    # recorded with all three cameras. The base pi05_astral/pi05_astral_lora stay
+    # 2-slot (right wrist zero-padded) so existing 2-camera episodes still train.
+    TrainConfig(
+        name="pi05_astral_3cam",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=50, discrete_state_input=False),
+        data=LeRobotAstralDataConfig(
+            repo_id="astral/astral_teleop",
+            base_config=DataConfig(prompt_from_task=True),
+            default_prompt="perform the manipulation task",
+            camera_map={
+                "base_0_rgb": "observation.images.base",
+                "left_wrist_0_rgb": "observation.images.left_wrist",
+                "right_wrist_0_rgb": "observation.images.right_wrist",
+            },
+        ),
+        batch_size=8,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=5e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=30_000,
+    ),
+    TrainConfig(
+        name="pi05_astral_lora_3cam",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=50,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotAstralDataConfig(
+            repo_id="astral/astral_teleop",
+            base_config=DataConfig(prompt_from_task=True),
+            default_prompt="perform the manipulation task",
+            camera_map={
+                "base_0_rgb": "observation.images.base",
+                "left_wrist_0_rgb": "observation.images.left_wrist",
+                "right_wrist_0_rgb": "observation.images.right_wrist",
+            },
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=1e-4,
+            decay_steps=30_000,
+            decay_lr=1e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=None,
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=50,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         num_train_steps=30_000,
     ),
     #
