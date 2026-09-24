@@ -1,5 +1,6 @@
 from collections.abc import Sequence
 import logging
+import math
 import pathlib
 import time
 from typing import Any, TypeAlias
@@ -65,9 +66,30 @@ class Policy(BasePolicy):
             self._rng = rng or jax.random.key(0)
 
     @override
-    def infer(self, obs: dict, *, noise: np.ndarray | None = None) -> dict:  # type: ignore[misc]
+    def infer(
+        self, obs: dict, *, noise: np.ndarray | None = None, rtc: dict | None = None
+    ) -> dict:  # type: ignore[misc]
         # Make a copy since transformations may modify the inputs in place.
         inputs = jax.tree.map(lambda x: x, obs)
+        if rtc is not None:
+            # The Astral input chain converts absolute joint targets to deltas,
+            # normalizes them, and pads to the model action dimension.  Reusing
+            # that chain is essential: guided denoising operates in model space.
+            prefix = np.array(rtc["prefix"], dtype=np.float32, copy=True)
+            if prefix.ndim != 2 or not np.isfinite(prefix).all():
+                raise ValueError("RTC prefix must be a finite [steps, action_dim] array")
+            valid = int(rtc["valid"])
+            delay = int(rtc["delay"])
+            if not 0 <= delay <= valid <= len(prefix):
+                raise ValueError("RTC requires 0 <= delay <= valid <= prefix length")
+            if not math.isfinite(float(rtc["max_guidance_weight"])) or float(rtc["max_guidance_weight"]) <= 0:
+                raise ValueError("RTC max_guidance_weight must be positive")
+            from openpi.models.rtc_guidance import SCHEDULES
+
+            schedule = str(rtc["schedule"]).lower()
+            if schedule not in SCHEDULES:
+                raise ValueError(f"unknown RTC prefix schedule: {schedule}")
+            inputs["actions"] = prefix
         inputs = self._input_transform(inputs)
         if not self._is_pytorch_model:
             # Make a batch and convert to jax.Array.
@@ -80,6 +102,16 @@ class Policy(BasePolicy):
 
         # Prepare kwargs for sample_actions
         sample_kwargs = dict(self._sample_kwargs)
+        if rtc is not None:
+            normalized_prefix = inputs.pop("actions")
+            scalar = (lambda x: x) if self._is_pytorch_model else jnp.asarray
+            sample_kwargs.update(
+                rtc_prefix=normalized_prefix,
+                rtc_delay=scalar(delay),
+                rtc_prefix_valid=scalar(valid),
+                rtc_max_guidance_weight=scalar(float(rtc["max_guidance_weight"])),
+                rtc_schedule=scalar(SCHEDULES[schedule]),
+            )
         if noise is not None:
             noise = torch.from_numpy(noise).to(self._pytorch_device) if self._is_pytorch_model else jnp.asarray(noise)
 

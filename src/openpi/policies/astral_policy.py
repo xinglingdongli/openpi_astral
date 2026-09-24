@@ -57,9 +57,9 @@ class AstralInputs(transforms.DataTransformFn):
     """Converts Astral dataset / inference inputs to the pi05 model input format.
 
     Used for both training and inference. The camera wiring is fully driven by
-    ``cameras`` (model slot -> input key); slots not present in the mapping are
-    zero-padded with mask=False, so adding/removing physical cameras only means
-    editing the mapping in LeRobotAstralDataConfig.
+    ``cameras`` (model slot -> input key). Slots absent from the mapping, or
+    configured slots omitted by an inference request, are zero-padded with
+    mask=False. Training still requires all configured dataset camera keys.
     """
 
     # Determines which model is used (image slot / mask conventions). Do not change.
@@ -84,9 +84,17 @@ class AstralInputs(transforms.DataTransformFn):
             raise ValueError(f"AstralInputs only supports pi0/pi05, got: {self.model_type}")
 
         all_slots = ("base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb")
+        # Inference may deliberately omit a configured camera for an ablation.
+        # Presence, rather than the static training camera map, determines the
+        # runtime mask. Dataset training is unchanged because repack supplies all
+        # configured keys and still fails earlier if a dataset feature is absent.
         parsed = {
-            slot: _parse_image(data[key]) for slot, key in self.cameras.items()
+            slot: _parse_image(data[key])
+            for slot, key in self.cameras.items()
+            if key in data
         }
+        if not parsed:
+            raise ValueError("AstralInputs requires at least one camera image")
         # Reference image for zero-padding shapes: any provided camera.
         ref = next(iter(parsed.values()))
         images = {slot: parsed.get(slot, np.zeros_like(ref)) for slot in all_slots}

@@ -373,8 +373,11 @@ class PI0Pytorch(nn.Module):
 
         return F.mse_loss(u_t, v_t, reduction="none")
 
-    @torch.no_grad()
-    def sample_actions(self, device, observation, noise=None, num_steps=10) -> Tensor:
+    def sample_actions(
+        self, device, observation, noise=None, num_steps=10,
+        rtc_prefix=None, rtc_delay=None, rtc_prefix_valid=None,
+        rtc_max_guidance_weight=None, rtc_schedule=None,
+    ) -> Tensor:
         """Do a full inference forward and compute the action (batch_size x num_steps x num_motors)"""
         bsize = observation.state.shape[0]
         if noise is None:
@@ -406,16 +409,24 @@ class PI0Pytorch(nn.Module):
         time = torch.tensor(1.0, dtype=torch.float32, device=device)
         while time >= -dt / 2:
             expanded_time = time.expand(bsize)
-            v_t = self.denoise_step(
-                state,
-                prefix_pad_masks,
-                past_key_values,
-                x_t,
-                expanded_time,
-            )
-
-            # Euler step - use new tensor assignment instead of in-place operation
-            x_t = x_t + dt * v_t
+            if rtc_prefix is not None:
+                from openpi.models import rtc_guidance
+                with torch.enable_grad():
+                    x_t = x_t.detach().requires_grad_(True)
+                    v_t = rtc_guidance.guide_torch(
+                        x_t, time, rtc_prefix, int(rtc_delay), int(rtc_prefix_valid),
+                        float(rtc_max_guidance_weight), int(rtc_schedule),
+                        lambda x: self.denoise_step(
+                            state, prefix_pad_masks, past_key_values, x, expanded_time
+                        ),
+                    )
+                    x_t = (x_t + dt * v_t).detach()
+            else:
+                with torch.no_grad():
+                    v_t = self.denoise_step(
+                        state, prefix_pad_masks, past_key_values, x_t, expanded_time
+                    )
+                    x_t = x_t + dt * v_t
             time += dt
         return x_t
 
