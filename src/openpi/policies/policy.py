@@ -16,6 +16,7 @@ from typing_extensions import override
 
 from openpi import transforms as _transforms
 from openpi.models import model as _model
+from openpi.policies.diagnostics import notify as _notify_diagnostic
 from openpi.shared import array_typing as at
 from openpi.shared import nnx_utils
 
@@ -34,6 +35,7 @@ class Policy(BasePolicy):
         metadata: dict[str, Any] | None = None,
         pytorch_device: str = "cpu",
         is_pytorch: bool = False,
+        diagnostic_hook=None,
     ):
         """Initialize the Policy.
 
@@ -55,6 +57,7 @@ class Policy(BasePolicy):
         self._metadata = metadata or {}
         self._is_pytorch_model = is_pytorch
         self._pytorch_device = pytorch_device
+        self._diagnostic_hook = diagnostic_hook
 
         if self._is_pytorch_model:
             self._model = self._model.to(pytorch_device)
@@ -64,6 +67,10 @@ class Policy(BasePolicy):
             # JAX model setup
             self._sample_actions = nnx_utils.module_jit(model.sample_actions)
             self._rng = rng or jax.random.key(0)
+
+    def set_diagnostic_hook(self, hook=None) -> None:
+        """Enable/disable a CPU observer without changing policy or RNG state."""
+        self._diagnostic_hook = hook
 
     @override
     def infer(
@@ -91,6 +98,12 @@ class Policy(BasePolicy):
                 raise ValueError(f"unknown RTC prefix schedule: {schedule}")
             inputs["actions"] = prefix
         inputs = self._input_transform(inputs)
+        if self._diagnostic_hook is not None:
+            _notify_diagnostic(self._diagnostic_hook, "model_input", {
+                "cpu_transformed_inputs": inputs,
+                "image_conversion": "uint8 -> float32 / 255 * 2 - 1 in Observation.from_dict",
+                "stage": "after input transforms, before device transfer and batching",
+            })
         if not self._is_pytorch_model:
             # Make a batch and convert to jax.Array.
             inputs = jax.tree.map(lambda x: jnp.asarray(x)[np.newaxis, ...], inputs)
@@ -131,6 +144,8 @@ class Policy(BasePolicy):
         else:
             outputs = jax.tree.map(lambda x: np.asarray(x[0, ...]), outputs)
 
+        if self._diagnostic_hook is not None:
+            _notify_diagnostic(self._diagnostic_hook, "model_host_output", outputs)
         outputs = self._output_transform(outputs)
         outputs["policy_timing"] = {
             "infer_ms": model_time * 1000,
